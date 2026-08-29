@@ -254,11 +254,11 @@ def calculate_kernel_atr_numba(tr: np.array, bandwidth: int, kernel_type: str) -
     return kernel_atr
 
 @jit(nopython=True)
-def _calculate_supertrend_numba(ha_high, ha_low, ha_close, tr, atr, period, multiplier, basic_upper_band, basic_lower_band, first_valid_atr_idx):
-    trending_up = np.empty_like(ha_close)
-    trending_down = np.empty_like(ha_close)
-    direction = np.empty_like(ha_close, dtype=np.int32)
-    supertrend = np.empty_like(ha_close)
+def _calculate_supertrend_numba(ha_close, basic_upper_band, basic_lower_band, first_valid_atr_idx):
+    trending_up = np.full_like(ha_close, np.nan)
+    trending_down = np.full_like(ha_close, np.nan)
+    direction = np.zeros_like(ha_close, dtype=np.int32)
+    supertrend = np.full_like(ha_close, np.nan)
 
     if first_valid_atr_idx is None or first_valid_atr_idx >= len(ha_close):
         return trending_up, trending_down, direction, supertrend
@@ -341,20 +341,24 @@ def calculate_kernel_smoothed_supertrend(df, period=10, multiplier=3.0, bandwidt
     basic_upper_band = ((ha_high + ha_low) / 2) + (multiplier * kernel_atr)
     basic_lower_band = ((ha_high + ha_low) / 2) - (multiplier * kernel_atr)
 
-    first_valid_atr_idx = np.where(~np.isnan(kernel_atr))[0][0] if np.any(~np.isnan(kernel_atr)) else -1  # Use -1 if no valid index
+    first_valid_atr_idx = period - 1 if len(kernel_atr) >= period else -1
 
     trending_up_arr, trending_down_arr, direction_arr, supertrend_arr = _calculate_supertrend_numba(
-        ha_high, ha_low, ha_close, tr, kernel_atr, period, multiplier, basic_upper_band, basic_lower_band, first_valid_atr_idx
+        ha_close, basic_upper_band, basic_lower_band, first_valid_atr_idx
     )
 
     # Validate Supertrend calculations
-    if np.any(~np.isfinite(supertrend_arr)):
+    valid_supertrend = supertrend_arr[first_valid_atr_idx:]
+    valid_trending_up = trending_up_arr[first_valid_atr_idx:]
+    valid_trending_down = trending_down_arr[first_valid_atr_idx:]
+    valid_direction = direction_arr[first_valid_atr_idx:]
+    if np.any(~np.isfinite(valid_supertrend)):
         raise ValueError("Supertrend calculation produced non-finite values")
-    if np.any(~np.isfinite(trending_up_arr)):
+    if np.any(~np.isfinite(valid_trending_up)):
         raise ValueError("Trending up calculation produced non-finite values")
-    if np.any(~np.isfinite(trending_down_arr)):
+    if np.any(~np.isfinite(valid_trending_down)):
         raise ValueError("Trending down calculation produced non-finite values")
-    if not np.all(np.isin(direction_arr, [-1, 0, 1])):
+    if not np.all(np.isin(valid_direction, [-1, 0, 1])):
         raise ValueError("Supertrend direction contains invalid values (must be -1, 0, or 1)")
 
     # Validate that supertrend values are within reasonable bounds
@@ -422,12 +426,13 @@ def calculate_heikin_ashi(df):
     return ha_df
 
 @jit(nopython=True)
-def _run_strategy_numba(st_dir, close_prices):
+def _run_strategy_numba(st_dir, open_prices):
     """
-    Execute SuperTrend trading strategy with same-candle position reversals
+    Execute SuperTrend trading strategy with next-bar-open execution.
 
-    This function allows both buy position exit and sell entry on the same candle,
-    matching the behavior of the Regular Supertrend strategy.
+    Signals are known only after a completed bar. Every order generated from bar i
+    is therefore executed at the open of bar i + 1. Reversals use the same next
+    open for the exit and entry legs.
 
     Logic:
     - Buy_Entry: When Supertrend direction changes to up (not in any position)
@@ -437,31 +442,33 @@ def _run_strategy_numba(st_dir, close_prices):
 
     This allows for same-candle reversals: exit long + enter short on same candle
     """
-    buy_entry_prices = np.full_like(close_prices, np.nan)
-    buy_exit_prices = np.full_like(close_prices, np.nan)
-    sell_entry_prices = np.full_like(close_prices, np.nan)
-    sell_exit_prices = np.full_like(close_prices, np.nan)
+    buy_entry_prices = np.full_like(open_prices, np.nan)
+    buy_exit_prices = np.full_like(open_prices, np.nan)
+    sell_entry_prices = np.full_like(open_prices, np.nan)
+    sell_exit_prices = np.full_like(open_prices, np.nan)
 
     in_buy_position = False
     in_sell_position = False
 
-    for i in range(1, len(close_prices)):
+    for i in range(1, len(open_prices) - 1):
+        execution_idx = i + 1
+
         # Check for Buy_Entry condition (Supertrend direction changes to up)
         if not in_buy_position and not in_sell_position and st_dir[i] == 1:
-            buy_entry_prices[i] = close_prices[i]
+            buy_entry_prices[execution_idx] = open_prices[execution_idx]
             in_buy_position = True
         # Check for Buy_Exit condition (Supertrend direction changes to down)
         elif in_buy_position and st_dir[i] == -1:
-            buy_exit_prices[i] = close_prices[i]
+            buy_exit_prices[execution_idx] = open_prices[execution_idx]
             in_buy_position = False
 
         # Check for Sell_Entry condition (Supertrend direction changes to down)
         if not in_sell_position and not in_buy_position and st_dir[i] == -1:
-            sell_entry_prices[i] = close_prices[i]
+            sell_entry_prices[execution_idx] = open_prices[execution_idx]
             in_sell_position = True
         # Check for Sell_Exit condition (Supertrend direction changes to up)
         elif in_sell_position and st_dir[i] == 1:
-            sell_exit_prices[i] = close_prices[i]
+            sell_exit_prices[execution_idx] = open_prices[execution_idx]
             in_sell_position = False
 
     return buy_entry_prices, buy_exit_prices, sell_entry_prices, sell_exit_prices
@@ -507,20 +514,24 @@ def calculate_supertrend(df, period=10, multiplier=3.0, suffix=""):
     basic_upper_band = ((ha_high + ha_low) / 2) + (multiplier * atr)
     basic_lower_band = ((ha_high + ha_low) / 2) - (multiplier * atr)
 
-    first_valid_atr_idx = np.where(~np.isnan(atr))[0][0] if np.any(~np.isnan(atr)) else -1  # Use -1 if no valid index
+    first_valid_atr_idx = period - 1 if len(atr) >= period else -1
 
     trending_up_arr, trending_down_arr, direction_arr, supertrend_arr = _calculate_supertrend_numba(
-        ha_high, ha_low, ha_close, tr, atr, period, multiplier, basic_upper_band, basic_lower_band, first_valid_atr_idx
+        ha_close, basic_upper_band, basic_lower_band, first_valid_atr_idx
     )
 
     # Validate Supertrend calculations
-    if np.any(~np.isfinite(supertrend_arr)):
+    valid_supertrend = supertrend_arr[first_valid_atr_idx:]
+    valid_trending_up = trending_up_arr[first_valid_atr_idx:]
+    valid_trending_down = trending_down_arr[first_valid_atr_idx:]
+    valid_direction = direction_arr[first_valid_atr_idx:]
+    if np.any(~np.isfinite(valid_supertrend)):
         raise ValueError("Supertrend calculation produced non-finite values")
-    if np.any(~np.isfinite(trending_up_arr)):
+    if np.any(~np.isfinite(valid_trending_up)):
         raise ValueError("Trending up calculation produced non-finite values")
-    if np.any(~np.isfinite(trending_down_arr)):
+    if np.any(~np.isfinite(valid_trending_down)):
         raise ValueError("Trending down calculation produced non-finite values")
-    if not np.all(np.isin(direction_arr, [-1, 0, 1])):
+    if not np.all(np.isin(valid_direction, [-1, 0, 1])):
         raise ValueError("Supertrend direction contains invalid values (must be -1, 0, or 1)")
 
     # Validate that supertrend values are within reasonable bounds
@@ -546,8 +557,17 @@ def calculate_supertrend(df, period=10, multiplier=3.0, suffix=""):
     return result_df
 
 
-def run_strategy_and_get_metrics(df_original, supertrend_params_list, kernel_params=None):
+def run_strategy_and_get_metrics(
+    df_original,
+    supertrend_params_list,
+    kernel_params=None,
+    initial_capital=100000.0,
+    position_size=1.0,
+    cost_per_order=125.0,
+):
     df = df_original.copy()
+    round_trip_cost = 2 * cost_per_order
+    print(f"Transaction cost: Rs {round_trip_cost:.2f} per completed trade")
 
     # Calculate Heikin Ashi
     ha_df = calculate_heikin_ashi(df.copy())
@@ -599,10 +619,10 @@ def run_strategy_and_get_metrics(df_original, supertrend_params_list, kernel_par
 
     # Convert direction column to numpy array for Numba
     st_dir = df[st_direction_cols[0]].to_numpy()
-    close_prices = df['Close'].to_numpy()
+    open_prices = df['Open'].to_numpy()
     
     buy_entry_prices, buy_exit_prices, sell_entry_prices, sell_exit_prices = _run_strategy_numba(
-        st_dir, close_prices
+        st_dir, open_prices
     )
 
     # Validate strategy results for consistency
@@ -622,7 +642,7 @@ def run_strategy_and_get_metrics(df_original, supertrend_params_list, kernel_par
         print(f"Warning: Unmatched buy trades - Entries: {buy_entries}, Exits: {buy_exits}")
 
     if sell_entries != sell_exits:
-        print(f"Warning: Unmatched sell trades - Entries: {sell_entries}, Exits: {sell_exits}")
+        print(f"Note: Unmatched sell signal count - Entries: {sell_entries}, Exits: {sell_exits}; final position is liquidated at the terminal close")
 
     # Check for overlapping positions (should be prevented by new logic)
     if total_positions > len(st_dir) * 0.5:  # More than 50% of bars have positions
@@ -641,13 +661,16 @@ def run_strategy_and_get_metrics(df_original, supertrend_params_list, kernel_par
         if not pd.isna(df['Buy_Entry'].iloc[i]):
             current_buy_entry = {'entry_price': df['Buy_Entry'].iloc[i], 'entry_date': df.index[i]}
         if not pd.isna(df['Buy_Exit'].iloc[i]) and current_buy_entry is not None:
-            profit = df['Buy_Exit'].iloc[i] - current_buy_entry['entry_price']
+            gross_profit = (df['Buy_Exit'].iloc[i] - current_buy_entry['entry_price']) * position_size
+            profit = gross_profit - (2 * cost_per_order)
             trades.append({
                 'type': 'buy',
                 'entry_date': current_buy_entry['entry_date'],
                 'exit_date': df.index[i],
                 'entry_price': current_buy_entry['entry_price'],
                 'exit_price': df['Buy_Exit'].iloc[i],
+                'gross_profit': gross_profit,
+                'costs': 2 * cost_per_order,
                 'profit': profit
             })
             current_buy_entry = None
@@ -655,16 +678,38 @@ def run_strategy_and_get_metrics(df_original, supertrend_params_list, kernel_par
         if not pd.isna(df['Sell_Entry'].iloc[i]):
             current_sell_entry = {'entry_price': df['Sell_Entry'].iloc[i], 'entry_date': df.index[i]}
         if not pd.isna(df['Sell_Exit'].iloc[i]) and current_sell_entry is not None:
-            profit = current_sell_entry['entry_price'] - df['Sell_Exit'].iloc[i]
+            gross_profit = (current_sell_entry['entry_price'] - df['Sell_Exit'].iloc[i]) * position_size
+            profit = gross_profit - (2 * cost_per_order)
             trades.append({
                 'type': 'sell',
                 'entry_date': current_sell_entry['entry_date'],
                 'exit_date': df.index[i],
                 'entry_price': current_sell_entry['entry_price'],
                 'exit_price': df['Sell_Exit'].iloc[i],
+                'gross_profit': gross_profit,
+                'costs': 2 * cost_per_order,
                 'profit': profit
             })
             current_sell_entry = None
+
+    # Do not discard the final open position. The final close is a terminal
+    # mark-to-market/liquidation convention, not a signal-generated fill.
+    if current_buy_entry is not None:
+        gross_profit = (df['Close'].iloc[-1] - current_buy_entry['entry_price']) * position_size
+        trades.append({
+            'type': 'buy', 'entry_date': current_buy_entry['entry_date'], 'exit_date': df.index[-1],
+            'entry_price': current_buy_entry['entry_price'], 'exit_price': df['Close'].iloc[-1],
+            'gross_profit': gross_profit, 'costs': 2 * cost_per_order,
+            'profit': gross_profit - (2 * cost_per_order),
+        })
+    if current_sell_entry is not None:
+        gross_profit = (current_sell_entry['entry_price'] - df['Close'].iloc[-1]) * position_size
+        trades.append({
+            'type': 'sell', 'entry_date': current_sell_entry['entry_date'], 'exit_date': df.index[-1],
+            'entry_price': current_sell_entry['entry_price'], 'exit_price': df['Close'].iloc[-1],
+            'gross_profit': gross_profit, 'costs': 2 * cost_per_order,
+            'profit': gross_profit - (2 * cost_per_order),
+        })
 
     trades_df = pd.DataFrame(trades)
 
@@ -691,10 +736,9 @@ def run_strategy_and_get_metrics(df_original, supertrend_params_list, kernel_par
 
         expectancy = (win_rate / 100 * avg_win) + ((1 - win_rate / 100) * avg_loss)
 
-        returns_series = trades_df.set_index('exit_date')['profit'].cumsum()
+        returns_series = trades_df.groupby('exit_date')['profit'].sum().sort_index().cumsum()
         net_profit = returns_series.iloc[-1] if not returns_series.empty else 0
 
-        initial_capital = 100000
         if not returns_series.empty:
             equity_curve = initial_capital + returns_series.fillna(0)
             peak = equity_curve.expanding(min_periods=1).max()
@@ -741,7 +785,10 @@ def run_strategy_and_get_metrics(df_original, supertrend_params_list, kernel_par
         max_winning_streak = max(winning_streaks) if winning_streaks else 0
         max_losing_streak = max(losing_streaks) if losing_streaks else 0
 
-        daily_returns = trades_df.set_index('exit_date')['profit'].resample('D').sum().fillna(0)
+        daily_pnl = trades_df.groupby(trades_df['exit_date'].dt.normalize())['profit'].sum()
+        trading_days = pd.DatetimeIndex(df.index.normalize().unique())
+        daily_equity = (initial_capital + daily_pnl.reindex(trading_days, fill_value=0).cumsum())
+        daily_returns = daily_equity.pct_change().dropna()
         annualized_returns = daily_returns.mean() * 252
         annualized_std_dev = daily_returns.std() * np.sqrt(252)
 
@@ -752,7 +799,7 @@ def run_strategy_and_get_metrics(df_original, supertrend_params_list, kernel_par
         sortino_ratio = annualized_returns / downside_std_dev if downside_std_dev != 0 else np.nan
 
         # Calculate Calmar Ratio (Annualized Return / Max Drawdown)
-        calmar_ratio = annualized_returns / abs(max_drawdown) if max_drawdown != 0 else np.nan
+        calmar_ratio = (annualized_returns * 100) / abs(max_drawdown) if max_drawdown != 0 else np.nan
 
         # Calculate additional trade-level metrics
         best_trade = winning_trades['profit'].max() if num_winning_trades > 0 else 0
